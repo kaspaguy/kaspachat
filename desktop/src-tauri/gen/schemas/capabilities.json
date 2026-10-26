@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"KaspaChat main window: core, content protection, notifications, and HTTP to the KaspaChat services only.","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-set-content-protected","notification:default",{"identifier":"http:default","allow":[{"url":"https://testnet.kaspachat.com/*"}]}]}}

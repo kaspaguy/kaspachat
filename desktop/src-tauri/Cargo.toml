@@ -1,0 +1,28 @@
+[package]
+name = "kaspachat"
+version = "0.5.7"
+description = "KaspaChat desktop — Kaspaveil protocol by Kaspaguy"
+authors = ["Kaspaguy <dev@kaspaguy.com>"]
+license = "LicenseRef-Proprietary"
+edition = "2021"
+
+[lib]
+name = "kaspachat_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-http = { version = "2", features = ["socks"] }
+kaspachat-tor = { path = "../../tor" }
+tokio = { version = "1", features = ["sync"] }
+tauri-plugin-notification = "=2.5.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

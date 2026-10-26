@@ -1,0 +1,83 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace = "com.kaspaguy.kaspachat"
+    ndkVersion = "30.0.16248370"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "com.kaspaguy.kaspachat"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 12
+        versionName "0.5.7"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    // Release signing: the key and its passwords live outside the repository. KC_SIGNING names a properties file with
+    // storeFile, storePassword, keyAlias, keyPassword (docs/STORE_SUBMISSION.md §4). Without it, release builds are unsigned.
+    def signingProps = System.getenv('KC_SIGNING')
+    signingConfigs {
+        if (signingProps) {
+            release {
+                def p = new Properties()
+                file(signingProps).withInputStream { p.load(it) }
+                storeFile file(p.storeFile)
+                storePassword p.storePassword
+                keyAlias p.keyAlias
+                keyPassword p.keyPassword
+            }
+        }
+    }
+    buildTypes {
+        release {
+            if (signingProps) signingConfig signingConfigs.release
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}
+
+// The Tor built into the app (../../../tor, Arti) is cross-compiled into src/main/jniLibs before every build
+// (arm64-v8a for phones, x86_64 for the emulator). Needs Rust with the Android targets and cargo-ndk; -PskipRust reuses
+// libraries already built.
+def cargo = new File(System.getProperty('user.home'), '.cargo/bin/cargo').with { it.exists() ? it.path : 'cargo' }
+tasks.register('torLib', Exec) {
+    workingDir file('../../../tor')
+    doFirst { environment 'ANDROID_NDK_HOME', android.ndkDirectory.path }
+    commandLine cargo, 'ndk', '-t', 'arm64-v8a', '-t', 'x86_64', '--platform', '24', '-o', file('src/main/jniLibs').path, 'build', '--release'
+}
+if (!project.hasProperty('skipRust')) preBuild.dependsOn torLib
+

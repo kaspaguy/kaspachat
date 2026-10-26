@@ -1,0 +1,15 @@
+{
+  "name": "@kaspaveil/relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "start": "node src/index.ts",
+    "test": "node --test --test-concurrency=1 test/*.test.ts"
+  },
+  "dependencies": {
+    "mongodb": "6.12.0",
+    "@noble/curves": "2.4.0"
+  }
+}

@@ -1,0 +1,137 @@
+pragma silverscript ^0.1.0;
+
+// Kaspaveil treasury — spending pot (PROTOTYPE — not audited, testnet only).
+//
+// Funds here can do exactly one thing: pay the Kaspa network fee for one Kaspaveil message
+// (a payload on the Kaspaveil lane), with the rest returned to this same pot. Nobody can withdraw.
+//
+// The relay key does admission control: only messages it signs (from users who paid) are paid for.
+// A throttle limits what it can spend: time is cut into 1-hour intervals, and one interval's fees may
+// not exceed max(FLOOR, 5 × the smoothed average of past intervals' fees). The average is an SMMA over
+// 168 intervals (one week), so a real burst of up to 5× normal use goes through at once, but a thief with
+// the relay key can raise the limit only slowly (about 1.76× a day). The root key does one thing here:
+// replace the relay key when it is lost or stolen. It isn't needed in normal operation.
+//
+// The pot is one covenant: its outputs carry its covenant ID, so the reservoir can recognise the
+// genuine pot and nobody can mint a copy with a different state.
+
+// SC-0019: the pot may have several LANES, UTXOs created together at genesis under its one covenant ID. Each spend still
+// moves exactly one lane (no merging, no splitting), so lanes run in parallel instead of one chained spend at a time.
+// Each lane has its own throttle with floor = the pot's hourly floor divided by the number of lanes, so all lanes
+// together can never spend faster than the pot's floor allows.
+contract TreasuryHot(pubkey rootKey, int floor, byte[32] initRelay, int initInterval, int initSpent, int initSmma, int initNonce) {
+    int constant MAX_FEE = 100000000;      // 1 KAS per message; headroom against fee spikes
+    int constant ADMIN_FEE = 1000000;      // 0.01 KAS: the most a relay-key replacement may take from the pot
+    int constant MIN_PAYLOAD = 256;        // accept a range, so a future message size can't strand the funds
+    int constant MAX_PAYLOAD = 8192;
+    int constant INTERVAL_DAA = 36000;     // 1 hour at 10 blocks/second
+    int constant N = 168;                  // SMMA length: 168 intervals = one week
+    int constant K = 5;                    // allowance = K × SMMA
+    int constant MIN_TOPUP = 100000000;    // 1 KAS: a top-up that doesn't fill the pot must add at least this much
+    int constant LOCK_TIME_THRESHOLD = 500000000000;   // Kaspa: lock times at or above this are timestamps, not DAA scores
+
+    byte[32] relay = initRelay;
+    int interval = initInterval;           // index of the interval the counters belong to (DAA score / INTERVAL_DAA)
+    int spent = initSpent;                 // fees paid in that interval, in sompi
+    int smma = initSmma;                   // smoothed average of the fees paid per interval, in sompi
+    int keyNonce = initNonce;              // makes every relay-key replacement signature single-use
+
+    // The SMMA as of interval `cur`: one SMMA step with the fees of the stored interval; then, for the empty
+    // intervals in between, a linear decay by 1/N each (to zero after N empty intervals). That is slightly faster
+    // than N more SMMA steps with zero fees, so the allowance falls back to the floor a little sooner after a quiet spell.
+    function smmaAt(int cur): int {
+        int s = smma;
+        if (cur > interval) {
+            s = (smma * (N - 1) + spent) / N;
+            int gap = cur - interval - 1;
+            if (gap >= N) {
+                s = 0;
+            } else {
+                s = s * (N - gap) / N;
+            }
+        }
+        return s;
+    }
+
+    // The transaction's lock time, as a DAA score. The lock-time check makes consensus enforce it (it fails when the
+    // input's sequence would switch lock time off), so it is a lower bound on the current DAA score: nobody can
+    // move the pot into a future interval. A timestamp lock time is refused: read as a DAA score it would jump the
+    // pot far into the future and freeze it.
+    function now(): int {
+        int lt = OpTxLockTime();
+        require(lt < LOCK_TIME_THRESHOLD);
+        require(tx.daa >= lt);
+        return lt;
+    }
+
+    function allowance(int s): int {
+        int a = K * s;
+        if (a < floor) {
+            a = floor;
+        }
+        return a;
+    }
+
+    // Exactly one pot input and one pot continuation, at output 0, carrying the pot's covenant ID.
+    function singleton() {
+        byte[32] cov = OpInputCovenantId(this.activeInputIndex);
+        require(this.activeInputIndex == 0);
+        require(OpCovInputCount(cov) == 1);
+        require(OpCovOutputCount(cov) == 1);
+        require(OpAuthOutputCount(this.activeInputIndex) == 1);
+        require(OpAuthOutputIdx(this.activeInputIndex, 0) == 0);
+    }
+
+    // One entry for the two ways the pot moves forward, so the interval roll is in the script once.
+    //  - Relay-paid message (one input): signed by the relay key, on the Kaspaveil lane, fee at most MAX_FEE,
+    //    and the interval's fees within the allowance.
+    //  - Reservoir top-up (two inputs; input 1 is the reservoir, which checks its own side): only when the pot
+    //    holds at most half of one interval's allowance, and only up to that allowance, so the pot stays small.
+    //    Each top-up fills the pot to the allowance, or uses the reservoir input up and adds at least 1 KAS, so
+    //    nobody can dribble funds in to burn reservoir fees or tie up the pot cheaply. Anyone may call it; the
+    //    relay signature is ignored.
+    entry step(sig relaySig) {
+        singleton();
+        int cur = now() / INTERVAL_DAA;
+        require(cur >= interval);
+        int s = smmaAt(cur);
+        int cap = allowance(s);
+        int total = 0;
+        if (cur == interval) {
+            total = spent;
+        }
+        int before = tx.inputs[0].value;
+        int after = tx.outputs[0].value;
+        if (tx.inputs.length == 1) {
+            require(checkSig(relaySig, pubkey(relay)));
+            require(OpTxSubnetId() == byte[20](0x4b564c0100000000000000000000000000000000));
+            int len = OpTxPayloadLen();
+            require(len >= MIN_PAYLOAD && len <= MAX_PAYLOAD);
+            require(tx.outputs.length == 1);
+            int fee = before - after;
+            require(fee >= 0 && fee <= MAX_FEE);
+            total = total + fee;
+            require(total <= cap);
+        } else {
+            require(tx.inputs.length == 2);
+            require(tx.outputs.length <= 2);
+            require(before * 2 <= cap);
+            require(after >= before);
+            require(after <= cap);
+            require(after == cap || (tx.outputs.length == 1 && after - before >= MIN_TOPUP));
+        }
+        validateOutputState(0, State { relay: relay, interval: cur, spent: total, smma: s, keyNonce: keyNonce });
+    }
+
+    // Root key: replaces the relay key and can do nothing else. Domain-separated by this pot's covenant ID.
+    entry replaceRelay(byte[32] newRelay, datasig rootSig) {
+        require(tx.inputs.length == 1);
+        require(tx.outputs.length == 1);
+        singleton();
+        byte[32] cov = OpInputCovenantId(0);
+        byte[32] d = blake2b(byte[]("kasveil/v1/relay-replace") + byte[](cov) + byte[](newRelay) + byte[](keyNonce as byte[8]));
+        require(checkMsgSig(rootSig, d, rootKey));
+        require(tx.outputs[0].value >= tx.inputs[0].value - ADMIN_FEE);
+        validateOutputState(0, State { relay: newRelay, interval: interval, spent: spent, smma: smma, keyNonce: keyNonce + 1 });
+    }
+}

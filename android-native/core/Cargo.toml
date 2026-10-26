@@ -1,0 +1,33 @@
+[package]
+name = "kaspachat-core"
+version = "0.1.0"
+edition = "2021"
+description = "JNI bridge from the KaspaChat Android app to the Kaspaveil v1 wire format (rust-impl)"
+publish = false
+license-file = "../../LICENSE"
+
+[lib]
+name = "kaspachat_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kaspaveil-wire = { path = "../../rust-impl" }
+bip39 = { version = "=2.1.0", features = ["std"] }
+jni = "=0.21.1"
+zeroize = "1.8"
+sha2 = "0.10"
+hmac = "=0.12.1"
+hkdf = "=0.12.4"
+scrypt = { version = "0.11", default-features = false }
+aes-gcm = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

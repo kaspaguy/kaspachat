@@ -1,0 +1,18 @@
+{
+  "name": "@kaspaveil/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "vectors": "node scripts/gen-vectors.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "@noble/post-quantum": "0.7.1",
+    "@scure/bip39": "2.4.0"
+  }
+}

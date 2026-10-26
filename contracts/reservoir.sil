@@ -1,0 +1,41 @@
+pragma silverscript ^0.1.0;
+
+// Kaspaveil treasury — reservoir (PROTOTYPE — not audited, testnet only).
+//
+// Receives the 75% treasury share of every payment. It has NO keys: nobody, including Kaspaguy,
+// can spend it except through topUp(), which anyone may call, and which can only move funds into
+// the genuine spending pot (recognised by its covenant ID) or back into the reservoir. How much the
+// pot may take, and when, is enforced by the pot itself: never more than one interval's allowance.
+//
+// Unused funds (SC-0015): a deposit still here sweepAgeDaa after it was made has outlived the message
+// credits it paid for (credits expire when the month renews), so anyone may sweep it, whole, to the
+// fixed Kaspaguy address sweepSpk. sweepAgeDaa = 0 builds a reservoir that never sweeps.
+
+contract Reservoir(byte[32] potCov, int sweepAgeDaa, byte[] sweepSpk) {
+    int constant MAX_FEE = 1000000;        // 0.01 KAS network fee for a top-up or a sweep
+
+    entry topUp() {
+        require(this.activeInputIndex == 1);
+        require(tx.inputs.length == 2);
+        require(OpInputCovenantId(0) == potCov);
+        int mine = tx.inputs[1].value;
+        int added = tx.outputs[0].value - tx.inputs[0].value;
+        require(added >= 0);
+        if (tx.outputs.length == 1) {
+            require(added >= mine - MAX_FEE);
+        } else {
+            require(tx.outputs.length == 2);
+            require(tx.outputs[1].scriptPubKey == tx.inputs[1].scriptPubKey);
+            require(added + tx.outputs[1].value >= mine - MAX_FEE);
+        }
+    }
+
+    entry sweep() {
+        require(sweepAgeDaa > 0);
+        require(this.ageDaa >= sweepAgeDaa);
+        require(tx.inputs.length == 1);
+        require(tx.outputs.length == 1);
+        require(tx.outputs[0].scriptPubKey == sweepSpk);
+        require(tx.outputs[0].value >= tx.inputs[0].value - MAX_FEE);
+    }
+}

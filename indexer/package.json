@@ -1,0 +1,14 @@
+{
+  "name": "@kaspaveil/indexer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "start": "node src/index.ts",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "mongodb": "6.12.0"
+  }
+}

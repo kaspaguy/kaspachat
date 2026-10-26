@@ -1,0 +1,20 @@
+[package]
+name = "kaspaveil-lanecheck"
+description = "Kaspaveil testnet lane check: sends one v1 transaction on the Kaspaveil lane with a 1,536-byte payload"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+kaspa-addresses.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-txscript.workspace = true
+kaspa-wrpc-client.workspace = true
+secp256k1.workspace = true
+tokio.workspace = true
+faster-hex.workspace = true
+rand.workspace = true
+blake2b_simd.workspace = true

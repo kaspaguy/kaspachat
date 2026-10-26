@@ -1,0 +1,23 @@
+[package]
+name = "kaspaveil-chaind"
+description = "Kaspaveil chain daemon: registry shards, treasury spending pot, deposits (testnet-10 in Phase 2). Localhost only."
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+kaspa-addresses.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-txscript.workspace = true
+kaspa-wrpc-client.workspace = true
+secp256k1.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+faster-hex.workspace = true
+rand.workspace = true
+blake2b_simd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.7.9"

@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "KaspaChat main window: core, content protection, notifications, and HTTP to the KaspaChat services only (directly or at their onion address through Tor).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-content-protected",
+    "notification:default",
+    { "identifier": "http:default", "allow": [{ "url": "https://testnet.kaspachat.com/*" }, { "url": "http://4da5abgegec3owzqjhfg5odt5u6a3wa2pbey4iofr467hejk6o5xdvad.onion/*" }] }
+  ]
+}

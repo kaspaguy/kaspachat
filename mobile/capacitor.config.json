@@ -1,0 +1,26 @@
+{
+  "appId": "com.kaspaguy.kaspachat",
+  "appName": "KaspaChat",
+  "webDir": "../app/dist-native",
+  "android": {
+    "allowMixedContent": false,
+    "includePlugins": [
+      "@capacitor-community/privacy-screen",
+      "@capacitor/app",
+      "@capacitor/local-notifications",
+      "@capacitor/share"
+    ]
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    },
+    "PrivacyScreen": {
+      "enable": false,
+      "preventScreenshots": true
+    },
+    "PushNotifications": {
+      "presentationOptions": []
+    }
+  }
+}

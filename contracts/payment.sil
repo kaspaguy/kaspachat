@@ -1,0 +1,49 @@
+pragma silverscript ^0.1.0;
+
+// Kaspaveil payment covenant (PROTOTYPE — not audited, testnet only). SC-0018.
+//
+// Every KAS payment for Plus months, renewals, lapsed-name claims and message top-ups goes to an address of this
+// contract, one address per order (the order tag is a constructor argument, so no two orders share an address and
+// a payment never needs a memo). It has NO keys: anyone may settle it, and settling can only do one thing, split it
+// 75% to the treasury reservoir and 25% to Kaspaguy (less at most 0.01 KAS network fee, taken from Kaspaguy's share).
+// The split is fixed in code. Settling needs the order's full amount (further payments to the same address add up),
+// so nobody can settle part of an order early and upset the relay's count. A payment that never makes up the full
+// amount, or arrives after the order was settled, can be settled on its own once it is LATE_DAA old (3 days): nothing
+// sent here is ever stranded. The relay credits such payments to the user as message credits (SC-0024).
+
+contract Payment(byte[32] order, byte[] devSpk, byte[] reservoirSpk, int minTotal) {
+    int constant MAX_FEE = 1000000;          // 0.01 KAS
+    int constant MAX_INPUTS = 8;             // payments to one order address settled together
+    int constant TREASURY_PCT = 75;
+    int constant LATE_DAA = 2592000;         // 3 days at 10 blocks/second
+
+    // All inputs are payments to this one order address, and the outputs split their total 75/25 (fee <= MAX_FEE).
+    function split(): int {
+        require(order.length == 32);
+        require(tx.inputs.length <= MAX_INPUTS);
+        int total = 0;
+        for(i, 0, tx.inputs.length, MAX_INPUTS) {
+            require(tx.inputs[i].scriptPubKey == tx.inputs[this.activeInputIndex].scriptPubKey);
+            total = total + tx.inputs[i].value;
+        }
+        int treasury = total * TREASURY_PCT / 100;
+        require(tx.outputs.length == 2);
+        require(tx.outputs[0].scriptPubKey == reservoirSpk);
+        require(tx.outputs[0].value >= treasury);
+        require(tx.outputs[1].scriptPubKey == devSpk);
+        require(tx.outputs[1].value >= total - treasury - MAX_FEE);
+        return total;
+    }
+
+    // The order's full amount, at any time.
+    entry settle() {
+        require(split() >= minTotal);
+    }
+
+    // Any amount, once this payment is LATE_DAA old: a relative lock time, so the network itself refuses the spend
+    // earlier. Every input settled this way carries the lock; a fresh one can only come in through settle().
+    entry settleLate() {
+        require(this.ageDaa >= LATE_DAA);
+        split();
+    }
+}

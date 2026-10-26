@@ -1,0 +1,467 @@
+pragma silverscript ^0.1.0;
+
+// Kaspaveil username registry, one shard (PROTOTYPE — not audited, testnet only).
+//
+// State: the root of an indexed Merkle tree (depth DEPTH) whose leaves are a sorted linked list
+// of 56-bit name keys, plus the operational keys, the monthly price and public audit counters.
+// Leaf states: free name (owner, expiry 0); Plus name (owner, expiry > 1); held for auction (no owner,
+// expiry = when it became reclaimable); released (no owner, expiry 1). "No owner" = 32 zero bytes.
+// Leaf = blake2b(key[8] || nextKey[8] || nextIdx[8] || owner[32] || expiry[8] || nonce[8]);
+// empty leaf = 32 zero bytes; nextKey == 0 ends the list; leaf 0 is the all-zero sentinel.
+//
+// Fixed in code, forever: the 25% Kaspaguy / 75% treasury split, the price limits, and the root
+// key, which can only replace the registrar and price keys and open transfers (once). Nobody can seize or delete a name.
+// All signed messages are domain-separated by registryId and shardId, so they can't be replayed
+// on another shard or another registry version.
+
+contract RegistryShard(
+    byte[32] initRoot,
+    byte[32] registryId,
+    int shardId,
+    pubkey dev,
+    byte[] reservoirSpk,
+    byte[] reservoirLongSpk,
+    pubkey rootKey,
+    byte[32] initRegistrar,
+    byte[32] initPriceKey,
+    byte[32] initAuctionKey,
+    int initPrice
+) {
+    int constant DEPTH = 20;
+    int constant MAX_NAME = 20;
+    int constant MIN_NAME = 3;
+    int constant MONTH_DAA = 25920000;       // 30 days at 10 blocks/second
+    int constant GRACE_DAA = 25920000;       // 30-day grace period after expiry
+    int constant MAX_MONTHS = 12;
+    int constant DEV_PCT = 25;
+    int constant TREASURY_PCT = 75;
+    int constant RELEASED = 1;               // expiry marker (with no owner): released from auction, open to register
+    int constant HOLD_DAA = 155520000;       // 6 months: the longest a lapsed name can be held for auction
+    int constant MIN_PRICE = 1000000000;     // 10 KAS per month
+    int constant MAX_PRICE = 100000000000;   // 1,000 KAS per month
+
+    byte[32] root = initRoot;
+    int size = 1;
+    byte[32] registrar = initRegistrar;
+    byte[32] priceKey = initPriceKey;
+    byte[32] auctionKey = initAuctionKey;
+    int price = initPrice;
+    int priceNonce = 0;
+    int keyNonce = 0;
+    int prepaidRegs = 0;
+    int prepaidMonths = 0;
+    int transfersOpen = 0;                   // SC-0017: transfers and sales stay closed until the root opens them, once
+
+    function leafHash(int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce): byte[32] {
+        return blake2b(byte[](key as byte[8]) + byte[](nextKey as byte[8]) + byte[](nextIdx as byte[8]) + byte[](owner)
+            + byte[](expiry as byte[8]) + byte[](nonce as byte[8]));
+    }
+
+    function rootFrom(byte[32] leaf, int index, byte[32][] path): byte[32] {
+        byte[32] node = leaf;
+        int idx = index;
+        for(i, 0, DEPTH, DEPTH) {
+            if (idx % 2 == 0) {
+                node = blake2b(byte[](node) + byte[](path[i]));
+            } else {
+                node = blake2b(byte[](path[i]) + byte[](node));
+            }
+            idx = idx / 2;
+        }
+        return node;
+    }
+
+    function nameKey(byte[] name): int {
+        byte[32] h = blake2b(name);
+        return int(byte[8](h.slice(0, 7) + byte[](0x00)));
+    }
+
+    function checkName(byte[] name) {
+        require(name.length >= MIN_NAME);
+        require(name.length <= MAX_NAME);
+        for(i, 0, name.length, MAX_NAME) {
+            int c = int(byte[1](name.slice(i, i + 1)));
+            require((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45);
+        }
+        require(int(byte[1](name.slice(0, 1))) != 45);
+        require(int(byte[1](name.slice(name.length - 1, name.length))) != 45);
+    }
+
+    function domain(byte[] label): byte[] {
+        return byte[]("kasveil/v1/") + label + byte[](registryId) + byte[](shardId as byte[8]);
+    }
+
+    // Every entry ends here: the registry UTXO keeps its value, and the shard stays one covenant. Exactly one input
+    // and one output carry this shard's covenant ID, and that output is output 0 (SC-0016), so no spend, including
+    // the permissionless ones (reclaim, release, renewDirect), can drop the binding and end the canonical lineage,
+    // or fork the shard into two continuations.
+    function keepValue() {
+        require(tx.outputs[0].value >= tx.inputs[this.activeInputIndex].value);
+        byte[32] cov = OpInputCovenantId(this.activeInputIndex);
+        require(OpCovInputCount(cov) == 1);
+        require(OpCovOutputCount(cov) == 1);
+        require(OpAuthOutputCount(this.activeInputIndex) == 1);
+        require(OpAuthOutputIdx(this.activeInputIndex, 0) == 0);
+    }
+
+    function payDirect(int months) {
+        int total = months * price;
+        byte[36] devSpk = new ScriptPubKeyP2PK(dev);
+        require(tx.outputs[1].scriptPubKey == byte[](devSpk));
+        require(tx.outputs[1].value >= total * DEV_PCT / 100);
+        // SC-0015: a one-month payment goes to the reservoir that sweeps unused funds after 30 days (credits
+        // expire when the month renews); a 2-12 month prepayment to the one that waits 360 days.
+        if (months == 1) {
+            require(tx.outputs[2].scriptPubKey == reservoirSpk);
+        } else {
+            require(tx.outputs[2].scriptPubKey == reservoirLongSpk);
+        }
+        require(tx.outputs[2].value >= total * TREASURY_PCT / 100);
+    }
+
+    // Proves the name is free and returns the new root with it inserted.
+    function insert(
+        byte[] name, byte[32] owner, int expiry,
+        int lowKey, int lowNextKey, int lowNextIdx, byte[32] lowOwner, int lowExpiry, int lowNonce,
+        int lowIdx, byte[32][] lowPath, byte[32][] newPath
+    ): byte[32] {
+        require(lowPath.length == DEPTH);
+        require(newPath.length == DEPTH);
+        require(size < 1048576);
+        checkName(name);
+        int key = nameKey(name);
+        require(key / 4503599627370496 == shardId);   // top 4 bits of the 56-bit key select the shard
+        require(rootFrom(leafHash(lowKey, lowNextKey, lowNextIdx, lowOwner, lowExpiry, lowNonce), lowIdx, lowPath) == root);
+        require(lowKey < key);
+        require(lowNextKey == 0 || key < lowNextKey);
+        byte[32] midRoot = rootFrom(leafHash(lowKey, key, size, lowOwner, lowExpiry, lowNonce), lowIdx, lowPath);
+        require(rootFrom(byte[32](0x0000000000000000000000000000000000000000000000000000000000000000), size, newPath) == midRoot);
+        return rootFrom(leafHash(key, lowNextKey, lowNextIdx, owner, expiry, 0), size, newPath);
+    }
+
+    // Free default name: "kv" + 8 base32 characters (a-z, 2-7) of BLAKE2b(owner || n), n = 0, 1 or 2
+    // (the two free re-rolls). Derived from the owner key, so nobody can pick or squat one.
+    function checkDefaultName(byte[] name, byte[32] owner, int n) {
+        require(n >= 0 && n <= 2);
+        require(name.length == 10);
+        require(int(byte[1](name.slice(0, 1))) == 107);   // 'k'
+        require(int(byte[1](name.slice(1, 2))) == 118);   // 'v'
+        byte[32] h = blake2b(byte[](owner) + byte[](n as byte[1]));
+        int v = 0;
+        for(j, 0, 5, 5) {
+            v = v * 256 + int(byte[2](h.slice(j, j + 1) + byte[](0x00)));
+        }
+        for(i, 0, 8, 8) {
+            int c = v % 32;
+            v = v / 32;
+            require(int(byte[1](name.slice(9 - i, 10 - i))) == (c < 26 ? 97 + c : 24 + c));
+        }
+    }
+
+    // Free tier: no payment, never expires (expiry 0), so it can't be renewed or sold. The bouncer
+    // co-signs after its per-device checks.
+    entry registerDefault(
+        byte[] name, byte[32] owner, int n, datasig regSig,
+        int lowKey, int lowNextKey, int lowNextIdx, byte[32] lowOwner, int lowExpiry, int lowNonce,
+        int lowIdx, byte[32][] lowPath, byte[32][] newPath
+    ) {
+        checkDefaultName(name, owner, n);
+        byte[32] d = blake2b(domain(byte[]("reg-default")) + name + byte[](owner));
+        require(checkMsgSig(regSig, d, pubkey(registrar)));
+        byte[32] newRoot = insert(name, owner, 0,
+            lowKey, lowNextKey, lowNextIdx, lowOwner, lowExpiry, lowNonce, lowIdx, lowPath, newPath);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size + 1, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Output 0: registry. Output 1: 25% to Kaspaguy. Output 2: 75% to the treasury reservoir.
+    // The registrar (bouncer) co-signs every new name, so the reserved list applies on both paths.
+    entry registerDirect(
+        byte[] name, byte[32] owner, int months, int nowDaa, datasig regSig,
+        int lowKey, int lowNextKey, int lowNextIdx, byte[32] lowOwner, int lowExpiry, int lowNonce,
+        int lowIdx, byte[32][] lowPath, byte[32][] newPath
+    ) {
+        require(months >= 1 && months <= MAX_MONTHS);
+        require(tx.daa >= nowDaa);
+        byte[32] d = blake2b(domain(byte[]("reg-direct")) + name + byte[](owner) + byte[](months as byte[8]) + byte[](nowDaa as byte[8]));
+        require(checkMsgSig(regSig, d, pubkey(registrar)));
+        byte[32] newRoot = insert(name, owner, nowDaa + months * MONTH_DAA,
+            lowKey, lowNextKey, lowNextIdx, lowOwner, lowExpiry, lowNonce, lowIdx, lowPath, newPath);
+        payDirect(months);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size + 1, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Credit path: paid earlier through the payment covenant; the registrar vouches and the count goes public.
+    entry registerPrepaid(
+        byte[] name, byte[32] owner, int months, int nowDaa, datasig regSig,
+        int lowKey, int lowNextKey, int lowNextIdx, byte[32] lowOwner, int lowExpiry, int lowNonce,
+        int lowIdx, byte[32][] lowPath, byte[32][] newPath
+    ) {
+        require(months >= 1 && months <= MAX_MONTHS);
+        require(tx.daa >= nowDaa);
+        byte[32] d = blake2b(domain(byte[]("reg-prepaid")) + name + byte[](owner) + byte[](months as byte[8]) + byte[](nowDaa as byte[8]));
+        require(checkMsgSig(regSig, d, pubkey(registrar)));
+        byte[32] newRoot = insert(name, owner, nowDaa + months * MONTH_DAA,
+            lowKey, lowNextKey, lowNextIdx, lowOwner, lowExpiry, lowNonce, lowIdx, lowPath, newPath);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size + 1, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs + 1, prepaidMonths: prepaidMonths + months, transfersOpen: transfersOpen
+        });
+    }
+
+    // Renewal extends from the current expiry. Direct renewal never needs the registrar.
+    entry renewDirect(
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path, int months
+    ) {
+        require(path.length == DEPTH);
+        require(owner != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        require(months >= 1 && months <= MAX_MONTHS);
+        require(OpTxInputDaaScore(this.activeInputIndex) <= expiry + GRACE_DAA);
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry + months * MONTH_DAA, nonce), idx, path);
+        payDirect(months);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    entry renewPrepaid(
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path, int months, datasig regSig
+    ) {
+        require(path.length == DEPTH);
+        require(owner != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        require(months >= 1 && months <= MAX_MONTHS);
+        require(OpTxInputDaaScore(this.activeInputIndex) <= expiry + GRACE_DAA);
+        byte[32] d = blake2b(domain(byte[]("renew-prepaid")) + byte[](key as byte[8]) + byte[](expiry as byte[8]) + byte[](months as byte[8]));
+        require(checkMsgSig(regSig, d, pubkey(registrar)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry + months * MONTH_DAA, nonce), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths + months, transfersOpen: transfersOpen
+        });
+    }
+
+    // The owner hands the name to a new key. The leaf nonce makes every signature single-use.
+    entry transfer(
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path,
+        byte[32] newOwner, datasig ownerSig
+    ) {
+        require(transfersOpen == 1);
+        require(path.length == DEPTH);
+        require(owner != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+        byte[32] d = blake2b(domain(byte[]("transfer")) + byte[](key as byte[8]) + byte[](newOwner) + byte[](nonce as byte[8]));
+        require(checkMsgSig(ownerSig, d, pubkey(owner)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, newOwner, expiry, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Resale: the seller signs (name, buyer, price, payout script, nonce). Kaspaguy takes 7.5% from each
+    // side: output 1 pays Kaspaguy 15% of the price, output 2 pays the seller 92.5%, so the buyer funds 107.5%.
+    entry sell(
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path,
+        byte[32] newOwner, int salePrice, byte[] payoutSpk, datasig sellerSig
+    ) {
+        require(transfersOpen == 1);
+        require(path.length == DEPTH);
+        require(salePrice > 0);
+        require(expiry > RELEASED && owner != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));   // Plus names only: not free, held or released names
+        require(OpTxInputDaaScore(this.activeInputIndex) <= expiry);
+        byte[32] d = blake2b(domain(byte[]("sell")) + byte[](key as byte[8]) + byte[](newOwner) + byte[](salePrice as byte[8])
+            + payoutSpk + byte[](nonce as byte[8]));
+        require(checkMsgSig(sellerSig, d, pubkey(owner)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[36] devSpk = new ScriptPubKeyP2PK(dev);
+        require(tx.outputs[1].scriptPubKey == byte[](devSpk));
+        require(tx.outputs[1].value >= salePrice * 15 / 100);
+        require(tx.outputs[2].scriptPubKey == payoutSpk);
+        require(tx.outputs[2].value >= salePrice * 925 / 1000);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, newOwner, expiry, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Lapsed Plus name: once expiry + 30-day grace has passed, anyone may put it up for auction.
+    // It then has no owner; its expiry field records when it became reclaimable (the start of the hold).
+    entry reclaim(int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path) {
+        require(path.length == DEPTH);
+        require(owner != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000) && expiry > RELEASED);
+        require(tx.daa >= expiry + GRACE_DAA);
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, byte[32](0x0000000000000000000000000000000000000000000000000000000000000000), expiry + GRACE_DAA, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Holding is bounded: 6 months after the hold began, anyone may release an unsold name. It then has
+    // no owner and no hold, and can be registered again like any name (claimReleased*, via the doorman).
+    entry release(int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path) {
+        require(path.length == DEPTH);
+        require(owner == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000) && expiry > RELEASED);
+        require(tx.daa >= expiry + HOLD_DAA);
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, byte[32](0x0000000000000000000000000000000000000000000000000000000000000000), RELEASED, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Auction win. Reserve = one month's price. The bid includes the first 30 days: 75% of that month's
+    // price goes to the treasury, the rest of the bid to Kaspaguy. The current auction key signs the
+    // winner's key, so a copied transaction can't redirect the name. From day 31: ordinary Plus name.
+    entry settleAuction(
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path,
+        byte[32] winner, int bid, int nowDaa, datasig auctionSig
+    ) {
+        require(path.length == DEPTH);
+        require(owner == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000) && expiry > RELEASED);
+        require(tx.daa >= nowDaa);
+        require(bid >= price);
+        byte[32] d = blake2b(domain(byte[]("auction")) + byte[](key as byte[8]) + byte[](winner) + byte[](bid as byte[8])
+            + byte[](nowDaa as byte[8]) + byte[](nonce as byte[8]));
+        require(checkMsgSig(auctionSig, d, pubkey(auctionKey)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[36] devSpk = new ScriptPubKeyP2PK(dev);
+        require(tx.outputs[1].scriptPubKey == byte[](devSpk));
+        require(tx.outputs[1].value >= bid - price * TREASURY_PCT / 100);
+        require(tx.outputs[2].scriptPubKey == reservoirSpk);
+        require(tx.outputs[2].value >= price * TREASURY_PCT / 100);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, winner, nowDaa + MONTH_DAA, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Auction win paid with credits: the auction key vouches, the relay submits, the public counter goes up.
+    entry settleAuctionPrepaid(
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path,
+        byte[32] winner, int nowDaa, datasig auctionSig
+    ) {
+        require(path.length == DEPTH);
+        require(owner == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000) && expiry > RELEASED);
+        require(tx.daa >= nowDaa);
+        byte[32] d = blake2b(domain(byte[]("auction-prepaid")) + byte[](key as byte[8]) + byte[](winner) + byte[](nowDaa as byte[8])
+            + byte[](nonce as byte[8]));
+        require(checkMsgSig(auctionSig, d, pubkey(auctionKey)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, winner, nowDaa + MONTH_DAA, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths + 1, transfersOpen: transfersOpen
+        });
+    }
+
+    // A released name registers again like a new one: the doorman signs and the same payment is due. The signature is
+    // its own message ("claim-…", with the leaf nonce), so the name's original registration signature, public on-chain,
+    // can't claim it back after a release, and a claim signature works once.
+    entry claimReleasedDirect(
+        byte[] name, byte[32] newOwner, int months, int nowDaa, datasig regSig,
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path
+    ) {
+        require(path.length == DEPTH);
+        require(owner == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000) && expiry == RELEASED);
+        require(months >= 1 && months <= MAX_MONTHS);
+        require(tx.daa >= nowDaa);
+        checkName(name);
+        require(nameKey(name) == key);
+        byte[32] d = blake2b(domain(byte[]("claim-direct")) + name + byte[](newOwner) + byte[](months as byte[8]) + byte[](nowDaa as byte[8])
+            + byte[](nonce as byte[8]));
+        require(checkMsgSig(regSig, d, pubkey(registrar)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        payDirect(months);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, newOwner, nowDaa + months * MONTH_DAA, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    entry claimReleasedPrepaid(
+        byte[] name, byte[32] newOwner, int months, int nowDaa, datasig regSig,
+        int key, int nextKey, int nextIdx, byte[32] owner, int expiry, int nonce, int idx, byte[32][] path
+    ) {
+        require(path.length == DEPTH);
+        require(owner == byte[32](0x0000000000000000000000000000000000000000000000000000000000000000) && expiry == RELEASED);
+        require(months >= 1 && months <= MAX_MONTHS);
+        require(tx.daa >= nowDaa);
+        checkName(name);
+        require(nameKey(name) == key);
+        byte[32] d = blake2b(domain(byte[]("claim-prepaid")) + name + byte[](newOwner) + byte[](months as byte[8]) + byte[](nowDaa as byte[8])
+            + byte[](nonce as byte[8]));
+        require(checkMsgSig(regSig, d, pubkey(registrar)));
+        require(rootFrom(leafHash(key, nextKey, nextIdx, owner, expiry, nonce), idx, path) == root);
+        byte[32] newRoot = rootFrom(leafHash(key, nextKey, nextIdx, newOwner, nowDaa + months * MONTH_DAA, nonce + 1), idx, path);
+        keepValue();
+        validateOutputState(0, State {
+            root: newRoot, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce, prepaidRegs: prepaidRegs + 1, prepaidMonths: prepaidMonths + months, transfersOpen: transfersOpen
+        });
+    }
+
+    // Price key: sets the monthly price only, within 10–1,000 KAS and at most ±50% per change.
+    entry setPrice(int newPrice, datasig priceSig) {
+        byte[32] d = blake2b(domain(byte[]("price")) + byte[](newPrice as byte[8]) + byte[](priceNonce as byte[8]));
+        require(checkMsgSig(priceSig, d, pubkey(priceKey)));
+        require(newPrice >= MIN_PRICE && newPrice <= MAX_PRICE);
+        require(newPrice * 2 >= price);
+        require(newPrice * 2 <= price * 3);
+        keepValue();
+        validateOutputState(0, State {
+            root: root, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: newPrice,
+            priceNonce: priceNonce + 1, keyNonce: keyNonce, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+
+    // Root key, one way (SC-0017): opens owner-to-owner transfers and sales. Nothing can close them again, so holders
+    // can rely on it; until then a name stays with its owner until it lapses, and lapsed names go to the next claimant.
+    entry openTransfers(datasig rootSig) {
+        require(transfersOpen == 0);
+        byte[32] d = blake2b(domain(byte[]("open-transfers")) + byte[](keyNonce as byte[8]));
+        require(checkMsgSig(rootSig, d, rootKey));
+        keepValue();
+        validateOutputState(0, State {
+            root: root, size: size, registrar: registrar, priceKey: priceKey, auctionKey: auctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce + 1, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: 1
+        });
+    }
+
+    // Root key: replaces the registrar, price and auction keys, and can do nothing else.
+    entry rotateKeys(byte[32] newRegistrar, byte[32] newPriceKey, byte[32] newAuctionKey, datasig rootSig) {
+        byte[32] d = blake2b(domain(byte[]("rotate")) + byte[](newRegistrar) + byte[](newPriceKey) + byte[](newAuctionKey)
+            + byte[](keyNonce as byte[8]));
+        require(checkMsgSig(rootSig, d, rootKey));
+        keepValue();
+        validateOutputState(0, State {
+            root: root, size: size, registrar: newRegistrar, priceKey: newPriceKey, auctionKey: newAuctionKey, price: price,
+            priceNonce: priceNonce, keyNonce: keyNonce + 1, prepaidRegs: prepaidRegs, prepaidMonths: prepaidMonths, transfersOpen: transfersOpen
+        });
+    }
+}
