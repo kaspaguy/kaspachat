@@ -4,7 +4,7 @@ description = "Kaspaveil root-key ceremony: 2-of-3 FROST (BIP-340) key generatio
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 
 [dependencies]
 frost-secp256k1-tr = { version = "=3.0.0", features = ["serde"] }

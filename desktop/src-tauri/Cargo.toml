@@ -3,7 +3,7 @@ name = "kaspachat"
 version = "0.5.7"
 description = "KaspaChat desktop — Kaspaveil protocol by Kaspaguy"
 authors = ["Kaspaguy <dev@kaspaguy.com>"]
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 edition = "2021"
 
 [lib]

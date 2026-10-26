@@ -14,6 +14,8 @@
 //   kaspaveil-lanecheck pot-burst <relaykey> <payload.hex> <pot.state> <n>             n chained messages, back to back
 //   kaspaveil-lanecheck pot-replace <rootkey|-> <newrelaykey> <pot.state>              root replaces the relay key
 //       (rootkey "-": the ceremony's signature in KASPAVEIL_REPLACE_SIG, 64-byte hex)
+//   kaspaveil-lanecheck zk-fund <fundkey> <kas> <redeem.hex>                         pays KAS to the P2SH of a RISC Zero Groth16 verifier script (ZK pool spike)
+//   kaspaveil-lanecheck zk-spend <sigscript.hex> <redeem.hex> <tokey> [tamper]        spends it with the proof; "tamper" flips one proof byte (the node must reject)
 //   kaspaveil-lanecheck pot-local <relaykey> <payload.hex> <pot.state>                 every relay mode, offline, on the local engine
 //   kaspaveil-lanecheck pot-tx-vector <relaykey> <payload.hex> <pot.state>             a pot-paid transaction as a JSON test vector (offline)
 // Needs KASPAVEIL_HOT (the silverscript kaspaveil_hot helper), KASPAVEIL_HOT_SIL (treasury_hot.sil), KASPAVEIL_RES_SIL (reservoir.sil),
@@ -90,6 +92,8 @@ async fn main() {
         Some("pot-relay") => pot_relay(&a[2], &a[3], &a[4], &a[5], a.get(6).map(|f| f.parse().expect("fee"))).await,
         Some("pot-burst") => pot_burst(&a[2], &a[3], &a[4], a[5].parse().expect("n")).await,
         Some("pot-replace") => pot_replace(&a[2], &a[3], &a[4]).await,
+        Some("zk-fund") => zk_fund(&a[2], a[3].parse().expect("KAS"), &a[4]).await,
+        Some("zk-spend") => zk_spend(&a[2], &a[3], &a[4], a.get(5).map(String::as_str) == Some("tamper")).await,
         Some("pot-local") => pot_local(&a[2], &a[3], &a[4]),
         Some("pot-tx-vector") => pot_tx_vector(&a[2], &a[3], &a[4]),
         _ => eprintln!("usage: see the source header"),
@@ -756,4 +760,68 @@ fn pot_tx_vector(relay_path: &str, payload_path: &str, state_path: &str) {
         entry.script_public_key.version(), entry.block_daa_score, pot.cov, out.value, h(out.script_public_key.script()), out.script_public_key.version(),
         cov.authorizing_input, cov.covenant_id, h(&tx.payload), tx.id(), nc.transient_mass / 4, nc.compute_mass, nc.transient_mass, storage, entry.amount - out.value
     );
+}
+
+// ---------- ZK pool spike: a RISC Zero Groth16 receipt verified by consensus (docs/ZK_SPIKE_R0.md) ----------
+
+async fn zk_fund(fund_path: &str, kas: u64, redeem_path: &str) {
+    let kp = keypair(fund_path);
+    let addr = address(&kp);
+    let spk = pay_to_script_hash_script(&read_hex(redeem_path));
+    let client = connect().await;
+    let now = now_daa(&client).await;
+    let utxos = client.get_utxos_by_addresses(vec![addr.clone()]).await.expect("utxos");
+    let best = utxos.iter().filter(|u| spendable(u, now)).max_by_key(|u| u.utxo_entry.amount).expect("no spendable funds");
+    let entry: UtxoEntry = best.utxo_entry.clone().into();
+    let build = |fee: u64| {
+        let input = TransactionInput::new_with_compute_budget(best.outpoint.into(), vec![], 0, 10);
+        let outs = vec![TransactionOutput::new(kas * KAS, spk.clone()), TransactionOutput::new(entry.amount - kas * KAS - fee, pay_to_address_script(&addr))];
+        Transaction::new(TX_VERSION_TOCCATA, vec![input], outs, 0, SUBNETWORK_ID_NATIVE, 0, vec![])
+    };
+    let fee = funding_fee(&build(0), std::slice::from_ref(&entry));
+    let tx = build(fee);
+    set_storage_mass(&tx, std::slice::from_ref(&entry));
+    let mut signed = sign(SignableTransaction::with_entries(tx, vec![entry]), kp).tx;
+    signed.finalize();
+    println!("paying {kas} KAS to the verifier script {}", p2sh_address(&spk));
+    submit_and_wait(&client, &signed, p2sh_address(&spk)).await;
+}
+
+async fn zk_spend(sig_path: &str, redeem_path: &str, to_path: &str, tamper: bool) {
+    let to = address(&keypair(to_path));
+    let redeem = read_hex(redeem_path);
+    let mut sig = read_hex(sig_path);
+    if tamper {
+        // flip a byte inside the proof data (well before the trailing redeem-script push)
+        let i = 200.min(sig.len() - redeem.len() - 10);
+        sig[i] ^= 1;
+    }
+    let spk = pay_to_script_hash_script(&redeem);
+    let client = connect().await;
+    let utxos = client.get_utxos_by_addresses(vec![p2sh_address(&spk)]).await.expect("utxos");
+    let u = utxos.iter().max_by_key(|u| u.utxo_entry.amount).expect("the verifier script holds no funds; run zk-fund first");
+    let entry: UtxoEntry = u.utxo_entry.clone().into();
+    let build = |fee: u64, b: u16| {
+        let ins = vec![TransactionInput::new_with_compute_budget(u.outpoint.into(), sig.clone(), 0, b)];
+        Transaction::new(TX_VERSION_TOCCATA, ins, vec![TransactionOutput::new(entry.amount - fee, pay_to_address_script(&to))], 0, SUBNETWORK_ID_NATIVE, 0, vec![])
+    };
+    let b = match dry_run(&build(1_000_000, 65_000), std::slice::from_ref(&entry)) {
+        Ok(units) => budget(units[0]),
+        Err(e) => {
+            println!("local engine rejects it: {e}");
+            if !tamper {
+                return;
+            }
+            1551
+        }
+    };
+    let (floor, masses) = min_fee(&build(0, b));
+    let tx = build(floor + 50_000, b);
+    set_storage_mass(&tx, std::slice::from_ref(&entry));
+    let mut tx = tx;
+    tx.finalize();
+    println!("verifier spend: budget {b}, {masses}, fee {} sompi{}", floor + 50_000, if tamper { " (TAMPERED proof)" } else { "" });
+    if submit_and_wait(&client, &tx, to).await {
+        println!("ZK VERIFIED ON TESTNET-10 by consensus");
+    }
 }

@@ -1,0 +1,4 @@
+module KaspaChatTor {
+    header "kaspachat_tor.h"
+    export *
+}

@@ -1,0 +1,29 @@
+[package]
+name = "kaspachat-tor"
+version = "0.5.7"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "static-sqlite"] }
+tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
+
+# Used when the crate is built on its own (the Android library); the desktop app's own profile applies there.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[dev-dependencies]
+# The client the desktop app's HTTP plugin uses, to check it reaches the onion host through the SOCKS port.
+reqwest = { version = "=0.12.28", default-features = false, features = ["socks", "rustls-tls"] }
