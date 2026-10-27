@@ -186,6 +186,7 @@ test('an account secret already used by an open order is refused', { skip }, asy
   received = 0;
   const c = claim();
   assert.equal((await api('/v1/topup/order', { kas: 20, claim: c })).status, 200);
+  assert.equal((await api('/v1/topup/order', { kas: 101, claim: claim() })).status, 400); // cap: one order is at most 100 KAS
   assert.equal((await api('/v1/topup/order', { kas: 20, claim: c })).status, 409);
 });
 

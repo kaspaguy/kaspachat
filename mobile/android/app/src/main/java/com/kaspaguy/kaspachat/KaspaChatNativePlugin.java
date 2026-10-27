@@ -59,6 +59,7 @@ public class KaspaChatNativePlugin extends Plugin {
         call.resolve();
     }
 
+
     @PluginMethod
     public void batteryStatus(PluginCall call) {
         PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);

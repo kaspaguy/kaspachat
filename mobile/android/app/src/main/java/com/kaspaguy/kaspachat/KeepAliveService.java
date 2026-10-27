@@ -19,6 +19,11 @@ public class KeepAliveService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        showForeground("Checking for new messages");
+        return START_STICKY;
+    }
+
+    void showForeground(String text) {
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel ch = new NotificationChannel(CHANNEL, "Background connection", NotificationManager.IMPORTANCE_MIN);
@@ -29,14 +34,13 @@ public class KeepAliveService extends Service {
         Notification n = new NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("KaspaChat is connected")
-            .setContentText("Checking for new messages")
+            .setContentText(text)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setContentIntent(open)
             .build();
         int type = Build.VERSION.SDK_INT >= 34 ? ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE : 0;
         ServiceCompat.startForeground(this, 1, n, type);
-        return START_STICKY;
     }
 
     @Override

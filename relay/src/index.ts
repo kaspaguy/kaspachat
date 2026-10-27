@@ -26,6 +26,7 @@ const KAS = 100_000_000;
 const MSG_FEE = 421_000; // sompi per relay-paid message in 5-message batches, measured on testnet-10 under load 2026-10-14 (SC-0020)
 const WELCOME = 10;
 const MIN_TOPUP = 20 * KAS;
+const MAX_TOPUP = 100 * KAS; // Kaspaguy 2026-10-27: payments are irreversible, so one order is capped at a month of Pro
 const MONTH_MS = 30 * 24 * 3600 * 1000;
 const TOKEN_DAYS = 30;
 const NAME_BITS = Number(process.env.KASPAVEIL_NAME_POW_BITS ?? 22);
@@ -410,7 +411,7 @@ const routes: Record<string, (req: http.IncomingMessage, body: any, arg?: string
   'POST /v1/topup/order': async (req, b) => {
     if (over(req, 'order', 10)) fail(429, 'slow down');
     const amount = Math.round(Number(b.kas ?? 20) * KAS);
-    if (!(amount >= MIN_TOPUP && amount <= 10_000 * KAS)) fail(400, 'top-up 20-10,000 KAS');
+    if (!(amount >= MIN_TOPUP && amount <= MAX_TOPUP)) fail(400, 'top-up 20-100 KAS');
     const { claim, claimHash, extraHash } = await freshClaim(b.claim);
     const dep = await chaind('/deposit', { reservoir: 'topup', min: amount });
     const o: Order = { _id: randomBytes(16).toString('hex'), kind: 'topup', months: 1, amount, deposit: dep.id, address: dep.address, claimHash, extraHash, status: 'pending', created: new Date(), txids: [] };

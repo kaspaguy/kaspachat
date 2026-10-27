@@ -889,7 +889,7 @@ function Topup({ onOrder }: { onOrder: (id: string) => void }) {
   const per = cfg ? Math.floor((amount * KAS * 0.75) / cfg.msgFee) : 0;
   return (
     <div className="row wrap">
-      <input type="number" min={20} step={10} value={amount} onChange={(e) => setAmount(Number(e.target.value))} style={{ width: 90 }} /> KAS
+      <input type="number" min={20} max={100} step={10} value={amount} onChange={(e) => setAmount(Number(e.target.value))} style={{ width: 90 }} /> KAS
       <span className="muted small">≈ {per.toLocaleString()} messages</span>
       <button onClick={() => engine.orderTopup(amount).then(onOrder).catch((e) => setErr(e.message))}>Top up</button>
       {err && <span className="error small">{err}</span>}
